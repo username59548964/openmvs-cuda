@@ -3,7 +3,8 @@
 # recompilable par le pilote pour les cartes futures. La version Windows officielle
 # n'est compilée que pour la carte de la machine des auteurs (CMAKE_CUDA_ARCHITECTURES
 # « native » : sm_89, RTX 40) et refuse les autres cartes.
-# Mêmes dépendances que les auteurs (vcpkg au commit de leur intégration continue).
+# Dépendances par vcpkg (version publiée 2026.10.16 : celle de l'intégration continue des
+# auteurs, de juin 2025, télécharge des paquets MSYS2 retirés depuis des miroirs).
 name: Compiler OpenMVS avec CUDA
 
 on:
@@ -13,6 +14,11 @@ on:
         description: "Publier les archives dans une version (release)"
         type: boolean
         default: true
+      systemes:
+        description: "Systèmes à compiler"
+        type: choice
+        options: [tous, windows, linux]
+        default: tous
 
 permissions:
   contents: write
@@ -20,7 +26,7 @@ permissions:
 env:
   OPENMVS_TAG: v2.4.0
   OPENMVS_COMMIT: 58117204c86bbb11a0b25b26a8987676cf11274d
-  VCPKG_COMMIT: ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0
+  VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489   # vcpkg 2026.10.16
   # code machine pour chaque génération + PTX (cartes futures, recompilé par le pilote)
   CUDA_ARCHS: "61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
   VERSION: "2.4.0-cuda12.9-1"
@@ -28,6 +34,7 @@ env:
 jobs:
   windows:
     name: Windows x64
+    if: ${{ inputs.systemes != 'linux' }}
     runs-on: windows-2022
     timeout-minutes: 355
     defaults:
@@ -105,6 +112,7 @@ jobs:
 
   linux:
     name: Ubuntu x64
+    if: ${{ inputs.systemes != 'windows' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
