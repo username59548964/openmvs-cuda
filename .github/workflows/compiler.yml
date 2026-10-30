@@ -1,0 +1,199 @@
+# OpenMVS 2.4.0 (sources officielles, commit vérifié) compilé avec CUDA pour toutes les
+# générations de cartes NVIDIA, de Pascal (GTX 10) à Blackwell (RTX 50), plus du PTX
+# recompilable par le pilote pour les cartes futures. La version Windows officielle
+# n'est compilée que pour la carte de la machine des auteurs (CMAKE_CUDA_ARCHITECTURES
+# « native » : sm_89, RTX 40) et refuse les autres cartes.
+# Mêmes dépendances que les auteurs (vcpkg au commit de leur intégration continue).
+name: Compiler OpenMVS avec CUDA
+
+on:
+  workflow_dispatch:
+    inputs:
+      publier:
+        description: "Publier les archives dans une version (release)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  OPENMVS_TAG: v2.4.0
+  OPENMVS_COMMIT: 58117204c86bbb11a0b25b26a8987676cf11274d
+  VCPKG_COMMIT: ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0
+  # code machine pour chaque génération + PTX (cartes futures, recompilé par le pilote)
+  CUDA_ARCHS: "61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+  VERSION: "2.4.0-cuda12.9-1"
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: bash
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows-release
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\\vcpkg-cache,readwrite"
+    steps:
+      - name: CUDA 12.9.1 (installateur réseau de NVIDIA, empreinte vérifiée)
+        shell: pwsh
+        run: |
+          $f = "$env:RUNNER_TEMP\cuda.exe"
+          Invoke-WebRequest -UseBasicParsing -Uri https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe -OutFile $f
+          $h = (Get-FileHash $f -Algorithm SHA256).Hash
+          if ($h -ne 'DE45C336AB4E9825018B546357DC9DE5DED9F89C4F5200EF52B8EEAC3B1B4072') { throw "empreinte inattendue : $h" }
+          $p = Start-Process $f -Wait -PassThru -ArgumentList '-s', 'nvcc_12.9', 'cudart_12.9', 'curand_12.9', 'curand_dev_12.9', 'thrust_12.9', 'cuobjdump_12.9', 'nvrtc_12.9', 'nvrtc_dev_12.9', 'visual_studio_integration_12.9'
+          if ($p.ExitCode -ne 0) { throw "installation CUDA : code $($p.ExitCode)" }
+          $c = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+          if (-not (Test-Path "$c\bin\nvcc.exe")) { throw 'nvcc absent' }
+          "CUDA_PATH=$c" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$c\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & "$c\bin\nvcc.exe" --version
+
+      - name: Sources d'OpenMVS et vcpkg (commits vérifiés)
+        run: |
+          git clone --quiet https://github.com/cdcseacave/openMVS.git src
+          git -C src checkout --quiet "$OPENMVS_COMMIT"
+          test "$(git -C src rev-parse HEAD)" = "$OPENMVS_COMMIT"
+          test "$(git -C src rev-parse "$OPENMVS_TAG^{commit}")" = "$OPENMVS_COMMIT"
+          git clone --quiet https://github.com/microsoft/vcpkg.git vcpkg
+          git -C vcpkg checkout --quiet "$VCPKG_COMMIT"
+          ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          mkdir -p vcpkg-cache
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE\\vcpkg" >> "$GITHUB_ENV"
+
+      - name: Cache des dépendances compilées (vcpkg)
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-win-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}-cuda12.9
+          restore-keys: vcpkg-win-${{ env.VCPKG_COMMIT }}-
+
+      - name: Configuration (CMake)
+        run: |
+          cmake -S src -B make -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-release \
+            -DOpenMVS_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+            -DOpenMVS_BUILD_VIEWER=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_ENABLE_TESTS=OFF
+
+      - name: Compilation
+        run: cmake --build make --config Release --parallel 4
+
+      - name: Archive et vérifications
+        run: |
+          exe=$(find make/bin -name DensifyPointCloud.exe | head -1)
+          test -n "$exe"
+          d=$(dirname "$exe")
+          mkdir -p out/OpenMVS
+          cp "$d"/*.exe "$d"/*.dll out/OpenMVS/
+          rm -f out/OpenMVS/*_test.exe
+          ls -la out/OpenMVS
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/out/OpenMVS/DensifyPointCloud.exe" --help | grep -i cuda-device)
+          cuobjdump --list-elf out/OpenMVS/DensifyPointCloud.exe
+          cuobjdump --list-ptx out/OpenMVS/DensifyPointCloud.exe
+          cp src/LICENSE out/OpenMVS/LICENSE-OpenMVS.txt
+          F="OpenMVS-$VERSION-Windows-x64.zip"
+          (cd out && 7z a -tzip -mx=9 "../$F" OpenMVS >/dev/null)
+          sha256sum "$F" | tee "$F.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: OpenMVS-*-Windows-x64.zip*
+
+  linux:
+    name: Ubuntu x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-linux-release
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
+    steps:
+      - name: CUDA 12.9 (dépôt de NVIDIA, clé vérifiée) et outils
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSLf -o k.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          echo "d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba  k.deb" | sha256sum -c
+          sudo dpkg -i k.deb
+          sudo apt-get update -y
+          sudo apt-get install -y cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcurand-dev-12-9 cuda-cuobjdump-12-9 cuda-nvrtc-dev-12-9 \
+            autoconf-archive libxmu-dev libdbus-1-dev libxtst-dev libxi-dev libxinerama-dev libxcursor-dev xorg-dev libgl-dev \
+            libglu1-mesa-dev autoconf automake bison libtool libltdl-dev pkg-config ninja-build
+          echo /usr/local/cuda-12.9/bin >> "$GITHUB_PATH"
+          /usr/local/cuda-12.9/bin/nvcc --version
+
+      - name: Sources d'OpenMVS et vcpkg (commits vérifiés)
+        run: |
+          git clone --quiet https://github.com/cdcseacave/openMVS.git src
+          git -C src checkout --quiet "$OPENMVS_COMMIT"
+          test "$(git -C src rev-parse HEAD)" = "$OPENMVS_COMMIT"
+          git clone --quiet https://github.com/microsoft/vcpkg.git vcpkg
+          git -C vcpkg checkout --quiet "$VCPKG_COMMIT"
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          mkdir -p vcpkg-cache
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Cache des dépendances compilées (vcpkg)
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}-cuda12.9
+          restore-keys: vcpkg-linux-${{ env.VCPKG_COMMIT }}-
+
+      - name: Configuration (CMake)
+        run: |
+          cmake -S src -B make -G Ninja -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET=x64-linux-release \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
+            -DOpenMVS_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
+            -DOpenMVS_BUILD_VIEWER=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_ENABLE_TESTS=OFF
+
+      - name: Compilation
+        run: cmake --build make --parallel 4
+
+      - name: Archive et vérifications
+        run: |
+          exe=$(find make/bin -name DensifyPointCloud -type f | head -1)
+          test -n "$exe"
+          d=$(dirname "$exe")
+          mkdir -p out/OpenMVS
+          for p in DensifyPointCloud InterfaceCOLMAP ReconstructMesh RefineMesh TextureMesh TransformScene; do cp "$d/$p" out/OpenMVS/; done
+          strip out/OpenMVS/*
+          ldd out/OpenMVS/DensifyPointCloud
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/out/OpenMVS/DensifyPointCloud" --help | grep -i cuda-device)
+          cuobjdump --list-elf out/OpenMVS/DensifyPointCloud
+          cp src/LICENSE out/OpenMVS/LICENSE-OpenMVS.txt
+          F="OpenMVS-$VERSION-Linux-x86_64.tar.xz"
+          tar -C out -cJf "$F" OpenMVS
+          sha256sum "$F" | tee "$F.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: OpenMVS-*-Linux-x86_64.tar.xz*
+
+  publier:
+    name: Publication
+    needs: [windows, linux]
+    if: ${{ always() && inputs.publier && (needs.windows.result == 'success' || needs.linux.result == 'success') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: a
+          merge-multiple: true
+      - name: Version (release) avec archives et empreintes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd a && ls -la && cat *.sha256 > SHA256SUMS
+          {
+            echo "OpenMVS $OPENMVS_TAG (commit $OPENMVS_COMMIT) compilé avec CUDA 12.9.1."
+            echo "Générations : $CUDA_ARCHS (Pascal GTX 10 à Blackwell RTX 50, PTX pour les suivantes)."
+            echo "Pilote NVIDIA 570 ou plus récent. Sources : https://github.com/cdcseacave/openMVS (AGPL-3.0)."
+            echo; echo '```'; cat SHA256SUMS; echo '```'
+          } > notes.md
+          gh release create "openmvs-$VERSION-r$GITHUB_RUN_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --title "OpenMVS $VERSION (compilation $GITHUB_RUN_NUMBER)" --notes-file notes.md \
+            OpenMVS-* SHA256SUMS
