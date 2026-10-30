@@ -81,7 +81,14 @@ jobs:
 
       - name: Configuration (CMake)
         run: |
-          cmake -S src -B make -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release \
+          # extensions MSBuild de CUDA : CMake les prend dans CUDA (-T cuda=…) ; copiées aussi dans
+          # Visual Studio (l'installateur de NVIDIA ne les y pose pas toujours sur ces machines)
+          vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath)
+          cuda=$(cygpath -u "$CUDA_PATH")
+          for d in "$(cygpath -u "$vs")"/MSBuild/Microsoft/VC/*/BuildCustomizations; do
+            cp "$cuda"/extras/visual_studio_integration/MSBuildExtensions/* "$d"/ || true
+          done
+          cmake -S src -B make -G "Visual Studio 17 2022" -A x64 -T "cuda=$CUDA_PATH" -DCMAKE_BUILD_TYPE=Release \
             -DVCPKG_TARGET_TRIPLET=x64-windows-release \
             -DOpenMVS_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
             -DOpenMVS_BUILD_VIEWER=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_ENABLE_TESTS=OFF
@@ -93,6 +100,12 @@ jobs:
         with:
           path: vcpkg-cache
           key: vcpkg-win-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}-cuda12.9
+
+      - name: CUDA bien pris en compte
+        run: |
+          grep -E "^CMAKE_CUDA_COMPILER:" make/CMakeCache.txt
+          ! grep -qE "^CMAKE_CUDA_COMPILER:.*NOTFOUND" make/CMakeCache.txt
+          grep -qE "^CMAKE_CUDA_COMPILER:" make/CMakeCache.txt
 
       - name: Compilation
         run: cmake --build make --config Release --parallel 4
@@ -117,6 +130,7 @@ jobs:
             case "${dll,,}" in kernel32.dll|user32.dll|advapi32.dll|shell32.dll|ole32.dll|ws2_32.dll|nvcuda.dll|api-ms-win-*|vcruntime140*.dll|msvcp140*.dll|vcomp140.dll) continue ;; esac
             test -f "out/OpenMVS/$dll" || { echo "DLL absente de l'archive : $dll"; exit 1; }
           done
+          grep -qi "nvcuda.dll" deps.txt || { echo "DensifyPointCloud sans CUDA"; exit 1; }
           cuobjdump --list-elf out/OpenMVS/DensifyPointCloud.exe
           cuobjdump --list-ptx out/OpenMVS/DensifyPointCloud.exe
           cp src/LICENSE out/OpenMVS/LICENSE-OpenMVS.txt
@@ -184,6 +198,11 @@ jobs:
         with:
           path: vcpkg-cache
           key: vcpkg-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}-cuda12.9
+
+      - name: CUDA bien pris en compte
+        run: |
+          grep -E "^CMAKE_CUDA_COMPILER:" make/CMakeCache.txt
+          ! grep -qE "^CMAKE_CUDA_COMPILER:.*NOTFOUND" make/CMakeCache.txt
 
       - name: Compilation
         run: cmake --build make --parallel 4
