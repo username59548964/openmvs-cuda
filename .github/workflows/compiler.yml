@@ -72,7 +72,8 @@ jobs:
           echo "VCPKG_ROOT=$GITHUB_WORKSPACE\\vcpkg" >> "$GITHUB_ENV"
 
       - name: Cache des dépendances compilées (vcpkg)
-        uses: actions/cache@v4
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: vcpkg-cache
           key: vcpkg-win-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}-cuda12.9
@@ -84,6 +85,14 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows-release \
             -DOpenMVS_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
             -DOpenMVS_BUILD_VIEWER=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_ENABLE_TESTS=OFF
+
+      # dépendances gardées dès qu'elles sont prêtes, même si la suite échoue
+      - name: Sauvegarde du cache des dépendances
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-win-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}-cuda12.9
 
       - name: Compilation
         run: cmake --build make --config Release --parallel 4
@@ -97,7 +106,17 @@ jobs:
           cp "$d"/*.exe "$d"/*.dll out/OpenMVS/
           rm -f out/OpenMVS/*_test.exe
           ls -la out/OpenMVS
-          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/out/OpenMVS/DensifyPointCloud.exe" --help | grep -i cuda-device)
+          # pas de pilote NVIDIA sur cette machine (nvcuda.dll) : le programme n'est pas lancé ;
+          # DLL dont il dépend (hors Windows et pilote : toutes présentes dans l'archive) et code CUDA
+          vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath)
+          db=$(find "$vs/VC/Tools/MSVC" -path "*Hostx64/x64/dumpbin.exe" | head -1)
+          "$db" //nologo //dependents out/OpenMVS/DensifyPointCloud.exe | tee deps.txt
+          # bibliothèque CUDA en DLL (si l'édition des liens l'a choisie) : jointe à l'archive
+          for c in $(grep -ioE 'cudart64_[0-9]+\.dll' deps.txt | sort -u); do cp "$(cygpath -u "$CUDA_PATH")/bin/$c" out/OpenMVS/; done
+          for dll in $(grep -ioE '^ +[a-z0-9_.+-]+\.dll' deps.txt | tr -d ' '); do
+            case "${dll,,}" in kernel32.dll|user32.dll|advapi32.dll|shell32.dll|ole32.dll|ws2_32.dll|nvcuda.dll|api-ms-win-*|vcruntime140*.dll|msvcp140*.dll|vcomp140.dll) continue ;; esac
+            test -f "out/OpenMVS/$dll" || { echo "DLL absente de l'archive : $dll"; exit 1; }
+          done
           cuobjdump --list-elf out/OpenMVS/DensifyPointCloud.exe
           cuobjdump --list-ptx out/OpenMVS/DensifyPointCloud.exe
           cp src/LICENSE out/OpenMVS/LICENSE-OpenMVS.txt
@@ -144,7 +163,8 @@ jobs:
           echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> "$GITHUB_ENV"
 
       - name: Cache des dépendances compilées (vcpkg)
-        uses: actions/cache@v4
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: vcpkg-cache
           key: vcpkg-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}-cuda12.9
@@ -153,9 +173,17 @@ jobs:
       - name: Configuration (CMake)
         run: |
           cmake -S src -B make -G Ninja -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET=x64-linux-release \
-            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
             -DOpenMVS_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
             -DOpenMVS_BUILD_VIEWER=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_USE_BREAKPAD=OFF -DOpenMVS_ENABLE_TESTS=OFF
+
+      # dépendances gardées dès qu'elles sont prêtes, même si la suite échoue
+      - name: Sauvegarde du cache des dépendances
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}-cuda12.9
 
       - name: Compilation
         run: cmake --build make --parallel 4
@@ -169,8 +197,12 @@ jobs:
           for p in DensifyPointCloud InterfaceCOLMAP ReconstructMesh RefineMesh TextureMesh TransformScene; do cp "$d/$p" out/OpenMVS/; done
           strip out/OpenMVS/*
           ldd out/OpenMVS/DensifyPointCloud
-          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/out/OpenMVS/DensifyPointCloud" --help | grep -i cuda-device)
+          # pas de pilote NVIDIA sur cette machine : libcuda factice des outils CUDA pour l'essai
+          mkdir -p "$RUNNER_TEMP/stub" && ln -sf /usr/local/cuda-12.9/targets/x86_64-linux/lib/stubs/libcuda.so "$RUNNER_TEMP/stub/libcuda.so.1"
+          (cd "$RUNNER_TEMP" && LD_LIBRARY_PATH="$RUNNER_TEMP/stub" "$GITHUB_WORKSPACE/out/OpenMVS/DensifyPointCloud" --help | grep -i cuda-device)
+          ! ldd out/OpenMVS/DensifyPointCloud | grep -q libcudart
           cuobjdump --list-elf out/OpenMVS/DensifyPointCloud
+          cuobjdump --list-ptx out/OpenMVS/DensifyPointCloud
           cp src/LICENSE out/OpenMVS/LICENSE-OpenMVS.txt
           F="OpenMVS-$VERSION-Linux-x86_64.tar.xz"
           tar -C out -cJf "$F" OpenMVS
