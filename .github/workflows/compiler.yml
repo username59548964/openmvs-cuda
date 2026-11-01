@@ -1,4 +1,4 @@
-# OpenMVS 2.4.0 (sources officielles, commit vérifié) compilé avec CUDA pour toutes les
+# OpenMVS 2.4.0 (sources officielles au commit vérifié, plus les correctifs de patches/) compilé avec CUDA pour toutes les
 # générations de cartes NVIDIA, de Pascal (GTX 10) à Blackwell (RTX 50), plus du PTX
 # recompilable par le pilote pour les cartes futures. La version Windows officielle
 # n'est compilée que pour la carte de la machine des auteurs (CMAKE_CUDA_ARCHITECTURES
@@ -65,6 +65,7 @@ jobs:
           git -C src checkout --quiet "$OPENMVS_COMMIT"
           test "$(git -C src rev-parse HEAD)" = "$OPENMVS_COMMIT"
           test "$(git -C src rev-parse "$OPENMVS_TAG^{commit}")" = "$OPENMVS_COMMIT"
+          for p in patches/*.patch; do git -C src apply --verbose "../$p"; done
           git clone --quiet https://github.com/microsoft/vcpkg.git vcpkg
           git -C vcpkg checkout --quiet "$VCPKG_COMMIT"
           ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
@@ -170,6 +171,7 @@ jobs:
           git clone --quiet https://github.com/cdcseacave/openMVS.git src
           git -C src checkout --quiet "$OPENMVS_COMMIT"
           test "$(git -C src rev-parse HEAD)" = "$OPENMVS_COMMIT"
+          for p in patches/*.patch; do git -C src apply --verbose "../$p"; done
           git clone --quiet https://github.com/microsoft/vcpkg.git vcpkg
           git -C vcpkg checkout --quiet "$VCPKG_COMMIT"
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics

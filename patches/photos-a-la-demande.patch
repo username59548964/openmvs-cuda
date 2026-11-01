@@ -1,0 +1,353 @@
+OpenMVS 2.4.0 : photos chargées à la demande dans DensifyPointCloud.
+Par défaut, OpenMVS charge toutes les photos de la scène à la préparation et
+les garde jusqu'à la fin. Avec la variable d'environnement
+OPENMVS_LAZY_IMAGES=N (N photos gardées en cache, 24 si vide), seules les
+dimensions sont lues à la préparation ; une photo est chargée quand une carte
+de profondeur la convertit en gris ou quand la fusion lit ses couleurs, puis
+relâchée (cache des plus récentes, photos en cours d'usage jamais libérées,
+verrou pour le calcul en parallèle). Même lecture et même mise à l'échelle que
+l'original. Sans la variable : comportement d'origine.
+OPENMVS_FUSION_MEMORY_MB=M : cache des cartes de la fusion borné à M Mo (sinon la
+RAM libre de la machine), limite suspendue pendant la fusion de chaque carte pour garder toutes ses voisines : même
+résultat, cartes relues plus souvent. Le journal donne la taille du cache et les
+voisines ignorées faute de cache (0 attendu).
+OPENMVS_FUSION_ORDER=1 : ordre de fusion indépendant du cache (carte ayant le plus de
+voisines déjà fusionnées) : même nuage quelle que soit la RAM.
+
+--- a/libs/MVS/SceneDensify.cpp
++++ b/libs/MVS/SceneDensify.cpp
+@@ -35,6 +35,92 @@
+ #include "PatchMatchCUDA.h"
+ #include "DMapCache.h"
+ 
++// OPENMVS_LAZY_IMAGES : images loaded on demand (photo and neighbors only)
++#include <mutex>
++#include <list>
++#include <atomic>
++#include <cstdlib>
++namespace MVS {
++struct LazyImages {
++	bool active = false;
++	size_t capacity = 24;
++	std::mutex mtx;
++	std::vector<unsigned> maxRes;
++	std::vector<int> pins;
++	std::list<IIndex> lru;
++	Image* base = nullptr;
++	size_t count = 0;
++	LazyImages() {
++		const char* v = std::getenv("OPENMVS_LAZY_IMAGES");
++		if (v != nullptr) {
++			active = true;
++			const long n = std::atol(v);
++			if (n > 0)
++				capacity = (size_t)n;
++		}
++	}
++	void Init(ImageArr& images) {
++		std::lock_guard<std::mutex> l(mtx);
++		base = images.data();
++		count = images.size();
++		maxRes.assign(count, 0);
++		pins.assign(count, 0);
++		lru.clear();
++	}
++	void SetResolution(IIndex i, unsigned r) {
++		std::lock_guard<std::mutex> l(mtx);
++		if (i < maxRes.size())
++			maxRes[i] = r;
++	}
++	IIndex Index(const Image* p) const { return (IIndex)(p - base); }
++	void Evict() {
++		for (auto it = lru.begin(); lru.size() > capacity && it != lru.end(); ) {
++			if (pins[*it] == 0) {
++				base[*it].ReleaseImage();
++				it = lru.erase(it);
++			} else
++				++it;
++		}
++	}
++	// load (if needed) and pin the image; returns false if it can not be read
++	bool Acquire(const Image* p) {
++		if (!active || base == nullptr)
++			return true;
++		const IIndex i = Index(p);
++		if (i >= count)
++			return true;
++		std::lock_guard<std::mutex> l(mtx);
++		Image& im = base[i];
++		lru.remove(i);
++		if (im.image.empty() && !im.ReloadImage(maxRes[i], true))
++			return false;
++		lru.push_back(i);
++		++pins[i];
++		Evict();
++		return true;
++	}
++	void Release(const Image* p) {
++		if (!active || base == nullptr)
++			return;
++		const IIndex i = Index(p);
++		if (i >= count)
++			return;
++		std::lock_guard<std::mutex> l(mtx);
++		if (pins[i] > 0)
++			--pins[i];
++		Evict();
++	}
++};
++static LazyImages g_lazyImages;
++static std::atomic<unsigned> g_lazySkipped{0}; // neighbor depth-maps not cached during fusion (ignored)
++static size_t g_lazyCacheMax = 0; // largest depth-map cache allowed during fusion (bytes)
++// gray copy of an image loaded on demand
++static inline void LazyToGray(const Image* p, Image32F& gray) {
++	g_lazyImages.Acquire(p);
++	p->image.toGray(gray, cv::COLOR_BGR2GRAY, true);
++	g_lazyImages.Release(p);
++}
++} // namespace MVS
+ using namespace MVS;
+ 
+ 
+@@ -198,12 +284,12 @@
+ 		viewTrg.scale = neighbor.scale;
+ 		viewTrg.camera = viewTrg.pImageData->camera;
+ 		if (loadImages) {
+-			viewTrg.pImageData->image.toGray(viewTrg.image, cv::COLOR_BGR2GRAY, true);
++			LazyToGray(viewTrg.pImageData, viewTrg.image);
+ 			if (DepthData::ViewData::ScaleImage(viewTrg.image, viewTrg.image, viewTrg.scale))
+ 				viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, viewTrg.image.size());
+ 		} else {
+ 			if (DepthData::ViewData::NeedScaleImage(viewTrg.scale))
+-				viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->image.size(), viewTrg.scale));
++				viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->GetSize(), viewTrg.scale));
+ 		}
+ 		DEBUG_EXTRA("Reference image %3u paired with image %3u", idxImage, neighbor.ID);
+ 	} else {
+@@ -218,12 +304,12 @@
+ 			viewTrg.scale = neighbor.scale;
+ 			viewTrg.camera = viewTrg.pImageData->camera;
+ 			if (loadImages) {
+-				viewTrg.pImageData->image.toGray(viewTrg.image, cv::COLOR_BGR2GRAY, true);
++				LazyToGray(viewTrg.pImageData, viewTrg.image);
+ 				if (DepthData::ViewData::ScaleImage(viewTrg.image, viewTrg.image, viewTrg.scale))
+ 					viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, viewTrg.image.size());
+ 			} else {
+ 				if (DepthData::ViewData::NeedScaleImage(viewTrg.scale))
+-					viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->image.size(), viewTrg.scale));
++					viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->GetSize(), viewTrg.scale));
+ 			}
+ 		}
+ 		#if TD_VERBOSE != TD_VERBOSE_OFF
+@@ -248,8 +334,8 @@
+ 	viewRef.pImageData = &scene.images[idxImage];
+ 	viewRef.camera = viewRef.pImageData->camera;
+ 	if (loadImages)
+-		viewRef.pImageData->image.toGray(viewRef.image, cv::COLOR_BGR2GRAY, true);
+-	depthData.size = viewRef.pImageData->image.size();
++		LazyToGray(viewRef.pImageData, viewRef.image);
++	depthData.size = viewRef.pImageData->GetSize();
+ 
+ 	// initialize views
+ 	for (IIndex i=1; i<depthData.images.size(); ) {
+@@ -1267,6 +1353,7 @@
+ 		if (bEstimateNormal && depthData.normalMap.empty())
+ 			EstimateNormalMaps();
+ 		const DepthData::ViewData& image = depthData.GetView();
++		if (bEstimateColor) g_lazyImages.Acquire(image.pImageData);
+ 		const size_t nNumPointsPrev(pointcloud.points.size());
+ 		for (int i=0; i<depthData.depthMap.rows; ++i) {
+ 			for (int j=0; j<depthData.depthMap.cols; ++j) {
+@@ -1286,6 +1373,7 @@
+ 				++nDepths;
+ 			}
+ 		}
++		if (bEstimateColor) g_lazyImages.Release(image.pImageData);
+ 		depthData.DecRef();
+ 		++nDepthMaps;
+ 		ASSERT(pointcloud.points.size() == pointcloud.pointViews.size());
+@@ -1326,16 +1414,33 @@
+ 	const size_t safetyMemory(MAXF(ROUND2INT<size_t>(memInfo.totalPhysical * 0.08), size_t(1*1024*1024*1024ull)/*1GB*/));
+ 	const size_t neededMemory(neededPointCloudMemory + safetyMemory);
+ 	const size_t minDMapsMemory(resolution / numDMaps * 8/*min dmaps in memory*/ * (1/*depth*/ + 3/*normal*/ + 1/*confidence*/) * 4/*bytes*/);
++	size_t available;
+ 	if (freeMemory < neededMemory) {
+ 		DEBUG("warning: not enough memory to cache depth-maps (%luMB needed, %luMB available)", neededMemory/1024/1024, freeMemory/1024/1024);
+-		return MINF(currentCacheMemory, minDMapsMemory);
++		available = MINF(currentCacheMemory, minDMapsMemory);
++	} else
++		available = freeMemory - neededMemory;
++	// OPENMVS_LAZY_IMAGES : optional cap of the depth-map cache during fusion (MB, OPENMVS_FUSION_MEMORY_MB),
++	// never below a reference depth-map and all the neighbors it may fuse (same result as without the cap)
++	if (const char* cap = std::getenv("OPENMVS_FUSION_MEMORY_MB")) {
++		const size_t capBytes((size_t)std::atoll(cap)*1024*1024);
++		// largest number of neighbors a remaining depth-map may fuse, plus the reference and a 50% margin
++		size_t maxNeighbors(0);
++		FOREACH(i, arrDepthData)
++			if (arrDepthData[i].IsValid() && !fusedDMaps[i])
++				maxNeighbors = MAXF(maxNeighbors, (size_t)MINF((unsigned)arrDepthData[i].neighbors.size(), OPTDENSE::nMaxViewsFuse));
++		const size_t floorBytes(resolution / numDMaps * (maxNeighbors + 1) * (1/*depth*/ + 3/*normal*/ + 1/*confidence*/) * 4/*bytes*/);
++		if (capBytes > 0)
++			available = MAXF(MINF(available, capBytes), floorBytes);
+ 	}
+-	return freeMemory - neededMemory;
++	g_lazyCacheMax = MAXF(g_lazyCacheMax, available);
++	return available;
+ } // GetAvailableMemory
+ 
+ // finds the best depth-map to fuse next that maximizes the number of neighbors already in cache
+ std::tuple<unsigned, unsigned, unsigned> FetchBestNextDMapIndex(const DepthDataArr& arrDepthData, const DMapCache& cacheDMaps, const BoolArr& fusedDMaps) {
+ 	const IIndexArr cachedImages = cacheDMaps.GetCachedImageIndices(true);
++	static const bool fixedOrder(std::getenv("OPENMVS_FUSION_ORDER") != nullptr);
+ 	IIndex bestImageIdx = NO_ID;
+ 	unsigned bestImageScore = 0, bestImageSize = std::numeric_limits<unsigned>::max();
+ 	FOREACH(idxImage, arrDepthData) {
+@@ -1346,6 +1451,12 @@
+ 			continue;
+ 		ASSERT(!depthData.neighbors.empty());
+ 		IIndexArr cachedNeighbors;
++		if (fixedOrder) {
++			// OPENMVS_LAZY_IMAGES : order independent of the cache (OPENMVS_FUSION_ORDER) : neighbors already fused
++			for (const ViewScore& neighbor: depthData.neighbors)
++				if (fusedDMaps[neighbor.ID])
++					cachedNeighbors.push_back(neighbor.ID);
++		} else
+ 		if (!cachedImages.empty()) {
+ 			IIndexArr neighbors(0, depthData.neighbors.size());
+ 			for (ViewScore& neighbor: depthData.neighbors)
+@@ -1426,6 +1537,10 @@
+ 		// fuse depth-map
+ 		cacheDMaps.UseImage(idxImage);
+ 		cacheDMaps.SkipMemoryCheckIdxImage(idxImage);
++		// OPENMVS_LAZY_IMAGES : the reference and all its neighbors stay cached while it is fused
++		// (otherwise a small cache ejects neighbors loaded a moment before and they are skipped)
++		if (std::getenv("OPENMVS_FUSION_MEMORY_MB"))
++			cacheDMaps.DisableMemoryCheck();
+ 		const DepthData& depthData(arrDepthData[idxImage]);
+ 		ASSERT(depthData.GetView().GetLocalID(scene.images) == idxImage);
+ 		ASSERT(!depthData.IsEmpty());
+@@ -1444,8 +1559,10 @@
+ 			if (!depthDataB.IsValid())
+ 				continue;
+ 			cacheDMaps.UseImage(neighbor.ID);
+-			if (depthDataB.IsEmpty())
++			if (depthDataB.IsEmpty()) {
++				++g_lazySkipped;
+ 				continue;
++			}
+ 			if (++numNeighbors >= OPTDENSE::nMaxViewsFuse)
+ 				#ifdef DENSE_USE_OPENMP
+ 				continue;
+@@ -1467,6 +1584,16 @@
+ 			depthIdxs.create(depthData.size);
+ 			depthIdxs.memset((uint8_t)NO_ID);
+ 		}
++		// // OPENMVS_LAZY_IMAGES : reference and neighbor images used for colors
++		std::vector<const Image*> lazyUsed;
++		if (bEstimateColor && g_lazyImages.active) {
++			lazyUsed.push_back(&scene.images[idxImage]);
++			for (const ViewScore& neighbor: depthData.neighbors)
++				if (arrDepthData[neighbor.ID].IsValid())
++					lazyUsed.push_back(&scene.images[neighbor.ID]);
++			for (const Image* p: lazyUsed)
++				g_lazyImages.Acquire(p);
++		}
+ 		const size_t nNumPointsPrev(pointcloud.points.size());
+ 		for (int i=0; i<depthData.size.height; ++i) {
+ 			for (int j=0; j<depthData.size.width; ++j) {
+@@ -1568,7 +1695,10 @@
+ 				}
+ 			}
+ 		}
++		for (const Image* p: lazyUsed)
++			g_lazyImages.Release(p);
+ 		fusedDMaps[idxImage] = true;
++		cacheDMaps.EnableMemoryCheck(); // back under the cap once the reference is fused
+ 		ASSERT(pointcloud.points.size() == pointcloud.pointViews.size() && pointcloud.points.size() == pointcloud.pointWeights.size() && pointcloud.points.size() == projs.size());
+ 		DEBUG_ULTIMATE("Depth-map for reference image %3u fused using %u depth-maps: %u new points, %u/%u cached images (%s)",
+ 			idxImage, depthData.images.size()-1, pointcloud.points.size()-nNumPointsPrev, numImageNeighborsInCache, numImagesInCache, TD_TIMER_GET_FMT().c_str());
+@@ -1583,6 +1713,7 @@
+ 	arrDepthIdx.Release();
+ 	cacheDMaps.ClearCache();	
+ 
++	DEBUG_EXTRA("Fusion depth-map cache: %u MB at most, %u neighbor depth-maps not cached (ignored)", (unsigned)(g_lazyCacheMax/1024/1024), g_lazySkipped.load());
+ 	DEBUG_EXTRA("Depth-maps fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%), %.2f hits in %.2f cached (%s)",
+ 		numDMapsFused, nDepths, pointcloud.points.size(), ROUND2INT((100.f*pointcloud.points.size())/nDepths),
+ 		static_cast<double>(totalNumImageNeighborsInCache) / numDMapsFused,
+@@ -1761,6 +1892,10 @@
+ 		// fuse depth-map
+ 		cacheDMaps.UseImage(idxImage);
+ 		cacheDMaps.SkipMemoryCheckIdxImage(idxImage);
++		// OPENMVS_LAZY_IMAGES : the reference and all its neighbors stay cached while it is fused
++		// (otherwise a small cache ejects neighbors loaded a moment before and they are skipped)
++		if (std::getenv("OPENMVS_FUSION_MEMORY_MB"))
++			cacheDMaps.DisableMemoryCheck();
+ 		const DepthData& depthData(arrDepthData[idxImage]);
+ 		ASSERT(depthData.GetView().GetLocalID(scene.images) == idxImage);
+ 		ASSERT(!depthData.IsEmpty());
+@@ -1786,8 +1921,10 @@
+ 			if (!depthDataB.IsValid())
+ 				continue;
+ 			cacheDMaps.UseImage(neighbor.ID);
+-			if (depthDataB.IsEmpty())
++			if (depthDataB.IsEmpty()) {
++				++g_lazySkipped;
+ 				continue;
++			}
+ 			neighbors[neighbor.ID] = true;
+ 			UseMask& useMask = arrUseMask[neighbor.ID];
+ 			if (!useMask.empty())
+@@ -1812,6 +1949,16 @@
+ 			useMask.create(depthData.size);
+ 			useMask.memset(0);
+ 		}
++		// // OPENMVS_LAZY_IMAGES : reference and neighbor images used for colors
++		std::vector<const Image*> lazyUsed;
++		if (bEstimateColor && g_lazyImages.active) {
++			lazyUsed.push_back(&scene.images[idxImage]);
++			for (const ViewScore& neighbor: depthData.neighbors)
++				if (arrDepthData[neighbor.ID].IsValid())
++					lazyUsed.push_back(&scene.images[neighbor.ID]);
++			for (const Image* p: lazyUsed)
++				g_lazyImages.Acquire(p);
++		}
+ 		// try to fuse each depth estimate
+ 		const size_t nNumPointsPrev(pointcloud.points.size());
+ 		for (int i=0; i<depthData.size.height; ++i) {
+@@ -1846,7 +1993,10 @@
+ 				}
+ 			}
+ 		}
++		for (const Image* p: lazyUsed)
++			g_lazyImages.Release(p);
+ 		fusedDMaps[idxImage] = true;
++		cacheDMaps.EnableMemoryCheck(); // back under the cap once the reference is fused
+ 		ASSERT(pointcloud.points.size() == pointcloud.pointViews.size() && pointcloud.points.size() == pointcloud.pointWeights.size());
+ 		DEBUG_ULTIMATE("Depth-map for reference image %3u fused using %u depth-maps: %u new points, %u/%u cached images (%s)",
+ 			idxImage, depthData.images.size() - 1, pointcloud.points.size() - nNumPointsPrev, numImageNeighborsInCache, numImagesInCache, TD_TIMER_GET_FMT().c_str());
+@@ -1863,6 +2013,7 @@
+ 	if (!_bEstimateNormal)
+ 		pointcloud.normals.Release();
+ 
++	DEBUG_EXTRA("Fusion depth-map cache: %u MB at most, %u neighbor depth-maps not cached (ignored)", (unsigned)(g_lazyCacheMax/1024/1024), g_lazySkipped.load());
+ 	DEBUG_EXTRA("Depth-maps dense fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%), %.2f hits in %.2f cached (%s)",
+ 		numDMapsFused, nDepths, pointcloud.points.size(), ROUND2INT((100.f*pointcloud.points.size())/nDepths),
+ 		static_cast<double>(totalNumImageNeighborsInCache) / numDMapsFused,
+@@ -2005,6 +2156,7 @@
+ 		TD_TIMER_START();
+ 		data.images.Reserve(images.GetSize());
+ 		imagesMap.Resize(images.GetSize());
++		g_lazyImages.Init(images);
+ 		#ifdef DENSE_USE_OPENMP
+ 		bool bAbort(false);
+ 		#pragma omp parallel for shared(data, bAbort)
+@@ -2036,7 +2188,8 @@
+ 			// reload image at the appropriate resolution
+ 			unsigned nResolutionLevel(OPTDENSE::nResolutionLevel);
+ 			const unsigned nMaxResolution(imageData.RecomputeMaxResolution(nResolutionLevel, OPTDENSE::nMinResolution, OPTDENSE::nMaxResolution));
+-			if (!imageData.ReloadImage(nMaxResolution)) {
++			g_lazyImages.SetResolution(idxImage, nMaxResolution);
++			if (!(g_lazyImages.active ? imageData.ReloadImage(nMaxResolution, false) : imageData.ReloadImage(nMaxResolution))) {
+ 				#ifdef DENSE_USE_OPENMP
+ 				bAbort = true;
+ 				#pragma omp flush (bAbort)
