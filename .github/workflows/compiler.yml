@@ -44,6 +44,10 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: x64-windows-release
       VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\\vcpkg-cache,readwrite"
     steps:
+      - name: Dépôt (correctifs de patches/)
+        uses: actions/checkout@v4
+        with:
+          path: depot
       - name: CUDA 12.9.1 (installateur réseau de NVIDIA, empreinte vérifiée)
         shell: pwsh
         run: |
@@ -65,7 +69,8 @@ jobs:
           git -C src checkout --quiet "$OPENMVS_COMMIT"
           test "$(git -C src rev-parse HEAD)" = "$OPENMVS_COMMIT"
           test "$(git -C src rev-parse "$OPENMVS_TAG^{commit}")" = "$OPENMVS_COMMIT"
-          for p in patches/*.patch; do git -C src apply --verbose "../$p"; done
+          ls depot/patches/*.patch > /dev/null   # arrêt si aucun correctif
+          for p in depot/patches/*.patch; do git -C src apply --verbose "../$p"; done
           git clone --quiet https://github.com/microsoft/vcpkg.git vcpkg
           git -C vcpkg checkout --quiet "$VCPKG_COMMIT"
           ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
@@ -153,6 +158,10 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: x64-linux-release
       VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
     steps:
+      - name: Dépôt (correctifs de patches/)
+        uses: actions/checkout@v4
+        with:
+          path: depot
       - name: CUDA 12.9 (dépôt de NVIDIA, clé vérifiée) et outils
         run: |
           cd "$RUNNER_TEMP"
@@ -171,7 +180,8 @@ jobs:
           git clone --quiet https://github.com/cdcseacave/openMVS.git src
           git -C src checkout --quiet "$OPENMVS_COMMIT"
           test "$(git -C src rev-parse HEAD)" = "$OPENMVS_COMMIT"
-          for p in patches/*.patch; do git -C src apply --verbose "../$p"; done
+          ls depot/patches/*.patch > /dev/null   # arrêt si aucun correctif
+          for p in depot/patches/*.patch; do git -C src apply --verbose "../$p"; done
           git clone --quiet https://github.com/microsoft/vcpkg.git vcpkg
           git -C vcpkg checkout --quiet "$VCPKG_COMMIT"
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics

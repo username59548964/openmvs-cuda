@@ -1,0 +1,2 @@
+# correctifs appliqués tels quels (pas de conversion des fins de ligne sous Windows)
+*.patch -text
