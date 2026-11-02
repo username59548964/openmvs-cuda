@@ -25,6 +25,7 @@ Correctifs (`patches/`, appliqués par `git apply` à la compilation) :
 | Correctif | Effet |
 |---|---|
 | `photos-a-la-demande.patch` | DensifyPointCloud : avec `OPENMVS_LAZY_IMAGES=N`, les photos sont chargées à la demande (photo de référence et voisines, cache de N photos) au lieu d'être toutes gardées en mémoire ; sans la variable, comportement d'origine |
+| `reprise-tours-geometriques.patch` | DensifyPointCloud : avec `OPENMVS_RESUME_GEOMETRIC=1`, une relance après interruption reprend les tours géométriques là où ils en étaient (état dans `depth-geo.txt`) au lieu de les refaire en entier ; sans la variable, comportement d'origine |
 
 Résultats : onglet *Releases* (Windows x64 en `.zip`, Linux x86_64 en `.tar.xz`,
 empreintes SHA-256). Pilote NVIDIA 570 ou plus récent.

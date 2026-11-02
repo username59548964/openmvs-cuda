@@ -29,7 +29,7 @@ env:
   VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489   # vcpkg 2026.10.16
   # code machine pour chaque génération + PTX (cartes futures, recompilé par le pilote)
   CUDA_ARCHS: "61-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
-  VERSION: "2.4.0-cuda12.9-1"
+  VERSION: "2.4.0-cuda12.9-2"
 
 jobs:
   windows:

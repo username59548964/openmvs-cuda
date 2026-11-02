@@ -1,0 +1,145 @@
+OpenMVS 2.4.0 : reprise des tours géométriques de DensifyPointCloud après une interruption.
+Par défaut, une relance garde les cartes de profondeur brutes déjà écrites mais refait
+en entier chaque tour géométrique (2 par défaut), et les cartes .geo.dmap du tour
+interrompu sont perdues. Avec la variable d'environnement OPENMVS_RESUME_GEOMETRIC=1,
+l'état des tours est noté dans depth-geo.txt (dossier de travail : « k running »,
+« k renaming », « k done ») ; à la relance, les tours finis sont sautés et le tour
+interrompu ne refait que les photos sans carte .geo.dmap. Pendant un tour, les cartes
+lues (.dmap) ne changent pas : le résultat est celui d'un calcul sans interruption.
+Si une carte brute doit être refaite, tous les tours sont refaits. Le remplacement des
+cartes brutes par celles du tour se fait d'après les fichiers écrits (une photo sans
+carte du tour garde la sienne). Sans la variable : comportement d'origine.
+Se place après photos-a-la-demande.patch.
+
+--- a/libs/MVS/SceneDensify.cpp
++++ b/libs/MVS/SceneDensify.cpp
+@@ -123,6 +123,41 @@
+ } // namespace MVS
+ using namespace MVS;
+ 
++// OPENMVS_RESUME_GEOMETRIC : resume the geometric-consistent iterations after an interruption;
++// state kept in depth-geo.txt (working folder) : "<iter> running", "<iter> renaming" or "<iter> done"
++namespace {
++bool ResumeGeometricEnabled() {
++	const char* v(getenv("OPENMVS_RESUME_GEOMETRIC"));
++	return v != NULL && *v != '\0' && *v != '0';
++}
++String GeometricStateFile() { return MAKE_PATH("depth-geo.txt"); }
++void WriteGeometricState(int iter, const char* state) {
++	if (!ResumeGeometricEnabled())
++		return;
++	const String name(GeometricStateFile()), tmp(name+".tmp");
++	{ std::ofstream f(tmp.c_str(), std::ios::trunc); f << iter << ' ' << state << '\n'; }
++	File::deleteFile(name);
++	File::renameFile(tmp, name);
++}
++bool ReadGeometricState(int& iter, std::string& state) {
++	std::ifstream f(GeometricStateFile().c_str());
++	return (bool)(f >> iter >> state);
++}
++// replace the raw depth-maps with the geometric-consistent ones (only those written)
++void ReplaceWithGeometric(const MVS::Scene& scene, const IIndexArr& images) {
++	for (IIndex idx: images) {
++		const String geoName(ComposeDepthFilePath(scene.images[idx].ID, "geo.dmap"));
++		if (!File::access(geoName))
++			continue;
++		const String rawName(ComposeDepthFilePath(scene.images[idx].ID, "dmap"));
++		File::deleteFile(rawName);
++		File::renameFile(geoName, rawName);
++	}
++}
++std::atomic<unsigned> g_rawEstimated{0}; // raw depth-maps written by this run
++bool g_resumeIter = false; // current geometric iteration resumed : depth-maps already written are kept
++} // namespace
++
+ 
+ // D E F I N E S ///////////////////////////////////////////////////
+ 
+@@ -2264,6 +2299,17 @@
+ 	}
+ 	#endif // _USE_CUDA
+ 
++	// geometric iteration interrupted while renaming its depth-maps : renaming finished first
++	int resumeIter(-1);
++	std::string resumeState;
++	const bool bResume(ResumeGeometricEnabled() && OPTDENSE::nEstimationGeometricIters && data.nFusionMode >= 0 && ReadGeometricState(resumeIter, resumeState));
++	if (bResume && resumeState == "renaming") {
++		ReplaceWithGeometric(*this, data.images);
++		resumeState = "done";
++		WriteGeometricState(resumeIter, "done");
++	}
++	g_rawEstimated = 0;
++
+ 	// initialize the queue of images to be processed
+ 	const int nOptimize(OPTDENSE::nOptimize);
+ 	if (OPTDENSE::nEstimationGeometricIters && data.nFusionMode >= 0)
+@@ -2298,10 +2344,26 @@
+ 			data.depthMaps.pmCUDA->Init(true);
+ 		}
+ 		#endif // _USE_CUDA
++		// resume : only if no raw depth-map was written again (otherwise all iterations are done again)
++		if (bResume && g_rawEstimated == 0 && resumeIter >= 0 && resumeIter < (int)OPTDENSE::nEstimationGeometricIters) {
++			if (resumeState == "done") {
++				data.nEstimationGeometricIter = resumeIter;
++			} else {
++				data.nEstimationGeometricIter = resumeIter-1;
++				g_resumeIter = true;
++			}
++			VERBOSE("Geometric-consistent depth-maps: resuming at iteration %d/%u (%s)", data.nEstimationGeometricIter+2, OPTDENSE::nEstimationGeometricIters, resumeState.c_str());
++		}
+ 		while (++data.nEstimationGeometricIter < (int)OPTDENSE::nEstimationGeometricIters) {
+ 			// initialize the queue of images to be geometric processed
+ 			if (data.nEstimationGeometricIter+1 == (int)OPTDENSE::nEstimationGeometricIters)
+ 				OPTDENSE::nOptimize = nOptimize;
++			if (!g_resumeIter) {
++				// depth-maps of an older interrupted iteration not used
++				for (IIndex idx: data.images)
++					File::deleteFile(ComposeDepthFilePath(images[idx].ID, "geo.dmap"));
++			}
++			WriteGeometricState(data.nEstimationGeometricIter, "running");
+ 			data.idxImage = 0;
+ 			ASSERT(data.events.IsEmpty());
+ 			data.events.AddEvent(new EVTProcessImage(0));
+@@ -2324,6 +2386,12 @@
+ 				return false;
+ 			data.progress.Release();
+ 			// replace raw depth-maps with the geometric-consistent ones
++			if (ResumeGeometricEnabled()) {
++				WriteGeometricState(data.nEstimationGeometricIter, "renaming");
++				ReplaceWithGeometric(*this, data.images);
++				WriteGeometricState(data.nEstimationGeometricIter, "done");
++				g_resumeIter = false;
++			} else
+ 			for (IIndex idx: data.images) {
+ 				const DepthData& depthData(data.depthMaps.arrDepthData[idx]);
+ 				if (!depthData.IsValid())
+@@ -2334,6 +2402,7 @@
+ 			}
+ 		}
+ 		data.nEstimationGeometricIter = -1;
++		OPTDENSE::nOptimize = nOptimize; // also when all iterations were resumed as done
+ 	}
+ 
+ 	if ((OPTDENSE::nOptimize & (OPTDENSE::ADJUST_CONFIDENCE | OPTDENSE::ADJUST_CONFIDENCE_FAST)) != 0) {
+@@ -2392,6 +2461,12 @@
+ 			const IIndex idx = data.images[evtImage.idxImage];
+ 			DepthData& depthData(data.depthMaps.arrDepthData[idx]);
+ 			const bool depthmapComputed(data.nFusionMode < 0 || (data.nFusionMode >= 0 && data.nEstimationGeometricIter < 0 && File::access(ComposeDepthFilePath(data.scene.images[idx].ID, "dmap"))));
++			if (g_resumeIter && data.nEstimationGeometricIter >= 0 && File::access(ComposeDepthFilePath(data.scene.images[idx].ID, "geo.dmap"))) {
++				// resumed iteration : depth-map already written
++				data.progress->operator++();
++				data.events.AddEvent(new EVTProcessImage((IIndex)Thread::safeInc(data.idxImage)));
++				break;
++			}
+ 			// initialize images pair: reference image and the best neighbor view
+ 			ASSERT(data.neighborsMap.IsEmpty() || data.neighborsMap[evtImage.idxImage] != NO_ID);
+ 			if (!data.depthMaps.InitViews(depthData, data.neighborsMap.IsEmpty()?NO_ID:data.neighborsMap[evtImage.idxImage], OPTDENSE::nNumViews, !depthmapComputed, depthmapComputed ? -1 : (data.nEstimationGeometricIter >= 0 ? 1 : 0))) {
+@@ -2496,6 +2571,8 @@
+ 			if (!depthData.depthMap.empty() &&
+ 				!depthData.Save(ComposeDepthFilePath(depthData.GetView().GetID(), data.nEstimationGeometricIter < 0 ? "dmap" : "geo.dmap")))
+ 				exit(EXIT_FAILURE);
++			if (!depthData.depthMap.empty() && data.nEstimationGeometricIter < 0)
++				++g_rawEstimated;
+ 			depthData.ReleaseImages();
+ 			depthData.Release();
+ 			data.progress->operator++();
